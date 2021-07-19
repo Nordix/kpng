@@ -6,6 +6,12 @@ import (
 	"sigs.k8s.io/kpng/pkg/api/localnetv1"
 )
 
+const (
+	ClusterIPService    = "ClusterIP"
+	NodePortService     = "NodePort"
+	LoadBalancerService = "LoadBalancer"
+)
+
 func asDummyIPs(set *localnetv1.IPSet) (ips []string) {
 	ips = make([]string, 0, len(set.V4)+len(set.V6))
 

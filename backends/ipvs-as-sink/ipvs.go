@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/google/seesaw/ipvs"
-	"github.com/spf13/pflag"
 	"github.com/vishvananda/netlink"
 	"k8s.io/klog"
 
@@ -21,7 +20,10 @@ import (
 type Backend struct {
 	localsink.Config
 
-	dryRun bool
+	dryRun           bool
+	nodeAddresses    []string
+	schedulingMethod string
+	weight           int32
 
 	dummy netlink.Link
 
@@ -55,13 +57,6 @@ func New() *Backend {
 
 func (s *Backend) Sink() localsink.Sink {
 	return filterreset.New(decoder.New(s))
-}
-
-func (s *Backend) BindFlags(flags *pflag.FlagSet) {
-	s.Config.BindFlags(flags)
-
-	// real ipvs sink flags
-	flags.BoolVar(&s.dryRun, "dry-run", false, "dry run (print instead of applying)")
 }
 
 func (s *Backend) Setup() {
@@ -178,7 +173,7 @@ func (s *Backend) Sync() {
 
 			s.dests.Set([]byte(string(lbKV.Key)+"/"+epIP), 0, ipvsSvcDst{
 				Svc: lb.ToService(),
-				Dst: ipvsDestination(epIP, lb.Port),
+				Dst: ipvsDestination(epIP, lb.Port, s.weight),
 			})
 		}
 	}
@@ -223,6 +218,99 @@ func (s *Backend) Sync() {
 func (s *Backend) SetService(svc *localnetv1.Service) {
 	klog.V(1).Infof("SetService(%v)", svc)
 
+	if svc.Type == NodePortService || svc.Type == LoadBalancerService {
+		s.handleNodePortSvc(svc)
+	}
+
+	if svc.Type == ClusterIPService {
+		s.handleClusterIPSvc(svc)
+	}
+}
+
+func (s *Backend) DeleteService(namespace, name string) {
+	klog.V(1).Infof("DeleteService(%q, %q)", namespace, name)
+
+	key := namespace + "/" + name
+	svc := s.svcs[key]
+	delete(s.svcs, key)
+
+	for _, ip := range asDummyIPs(svc.IPs.All()) {
+		s.dummyIPsRefCounts[ip]--
+	}
+
+	// remove all LBs associated to the service
+	s.lbs.DeleteByPrefix([]byte(key + "/"))
+}
+
+func (s *Backend) SetEndpoint(namespace, serviceName, key string, endpoint *localnetv1.Endpoint) {
+	klog.Infof("SetEndpoint(%q, %q, %q, %v)", namespace, serviceName, key, endpoint)
+
+	svcKey := namespace + "/" + serviceName
+	prefix := svcKey + "/" + key + "/"
+
+	for _, ips := range [][]string{endpoint.IPs.V4, endpoint.IPs.V6} {
+		if len(ips) == 0 {
+			continue
+		}
+
+		ip := ips[0]
+		s.endpoints.Set([]byte(prefix+ip), 0, ip)
+
+		// add a destination for every LB of this service
+		for _, lbKV := range s.lbs.GetByPrefix([]byte(svcKey + "/")) {
+			lb := lbKV.Value.(ipvsLB)
+
+			s.dests.Set([]byte(string(lbKV.Key)+"/"+ip), 0, ipvsSvcDst{
+				Svc: lb.ToService(),
+				Dst: ipvsDestination(ip, lb.Port, s.weight),
+			})
+		}
+	}
+
+}
+
+func (s *Backend) DeleteEndpoint(namespace, serviceName, key string) {
+	klog.Infof("DeleteEndpoint(%q, %q, %q)", namespace, serviceName, key)
+
+	svcPrefix := []byte(namespace + "/" + serviceName + "/")
+	prefix := []byte(string(svcPrefix) + key + "/")
+
+	for _, kv := range s.endpoints.GetByPrefix(prefix) {
+		// remove this endpoint from the destinations if the service
+		ip := kv.Value.(string)
+		suffix := []byte("/" + ip)
+
+		for _, destKV := range s.dests.GetByPrefix(svcPrefix) {
+			if bytes.HasSuffix(destKV.Key, suffix) {
+				s.dests.Delete(destKV.Key)
+			}
+		}
+	}
+
+	// remove this endpoint from the endpoints
+	s.endpoints.DeleteByPrefix(prefix)
+}
+
+func (s *Backend) handleClusterIPSvc(svc *localnetv1.Service) {
+	s.addClusterIPToKubeIPVSIntf(svc)
+
+	s.storeLBSvc(svc, svc.IPs.All().All(), ClusterIPService)
+}
+
+func (s *Backend) handleNodePortSvc(svc *localnetv1.Service) {
+	//NodePort svc has clusterIP. It needs to be added to IPVS.
+	s.addClusterIPToKubeIPVSIntf(svc)
+
+	//Node Addresses need to be added as NodePortService
+	//so that in sync(), nodePort is attached to nodeIPs.
+	s.storeLBSvc(svc, s.nodeAddresses, NodePortService)
+
+	//NodePort svc clusterIPs need to be added as ClusterIPService
+	//so that in sync(), port is attached to clusterIP.
+	s.storeLBSvc(svc, svc.IPs.All().All(), ClusterIPService)
+}
+
+func (s *Backend) addClusterIPToKubeIPVSIntf(svc *localnetv1.Service) {
 	key := svc.Namespace + "/" + svc.Name
 
 	// update the svc
@@ -262,80 +350,16 @@ func (s *Backend) SetService(svc *localnetv1.Service) {
 	for _, ip := range asDummyIPs(removed) {
 		s.dummyIPsRefCounts[ip]--
 	}
+}
 
-	// recompute all service LBs
-	s.lbs.DeleteByPrefix([]byte(key + "/"))
+func (s *Backend) storeLBSvc(svc *localnetv1.Service, addrList []string, svcType string) {
+	key := svc.Namespace + "/" + svc.Name
 
-	for _, ip := range currentIPs.All() {
+	for _, ip := range addrList {
 		prefix := key + "/" + ip + "/"
-
 		for _, port := range svc.Ports {
 			lbKey := prefix + epPortSuffix(port)
-			s.lbs.Set([]byte(lbKey), 0, ipvsLB{IP: ip, ServiceKey: key, Port: port})
+			s.lbs.Set([]byte(lbKey), 0, ipvsLB{IP: ip, ServiceKey: key, Port: port, SchedulingMethod: s.schedulingMethod, ServiceType: svcType})
 		}
 	}
-}
-
-func (s *Backend) DeleteService(namespace, name string) {
-	klog.V(1).Infof("DeleteService(%q, %q)", namespace, name)
-
-	key := namespace + "/" + name
-	svc := s.svcs[key]
-	delete(s.svcs, key)
-
-	for _, ip := range asDummyIPs(svc.IPs.All()) {
-		s.dummyIPsRefCounts[ip]--
-	}
-
-	// remove all LBs associated to the service
-	s.lbs.DeleteByPrefix([]byte(key + "/"))
-}
-
-func (s *Backend) SetEndpoint(namespace, serviceName, key string, endpoint *localnetv1.Endpoint) {
-	klog.Infof("SetEndpoint(%q, %q, %q, %v)", namespace, serviceName, key, endpoint)
-
-	svcKey := namespace + "/" + serviceName
-	prefix := svcKey + "/" + key + "/"
-
-	for _, ips := range [][]string{endpoint.IPs.V4, endpoint.IPs.V6} {
-		if len(ips) == 0 {
-			continue
-		}
-
-		ip := ips[0]
-		s.endpoints.Set([]byte(prefix+ip), 0, ip)
-
-		// add a destination for every LB of this service
-		for _, lbKV := range s.lbs.GetByPrefix([]byte(svcKey + "/")) {
-			lb := lbKV.Value.(ipvsLB)
-
-			s.dests.Set([]byte(string(lbKV.Key)+"/"+ip), 0, ipvsSvcDst{
-				Svc: lb.ToService(),
-				Dst: ipvsDestination(ip, lb.Port),
-			})
-		}
-	}
-
-}
-
-func (s *Backend) DeleteEndpoint(namespace, serviceName, key string) {
-	klog.Infof("DeleteEndpoint(%q, %q, %q)", namespace, serviceName, key)
-
-	svcPrefix := []byte(namespace + "/" + serviceName + "/")
-	prefix := []byte(string(svcPrefix) + key + "/")
-
-	for _, kv := range s.endpoints.GetByPrefix(prefix) {
-		// remove this endpoint from the destinations if the service
-		ip := kv.Value.(string)
-		suffix := []byte("/" + ip)
-
-		for _, destKV := range s.dests.GetByPrefix(svcPrefix) {
-			if bytes.HasSuffix(destKV.Key, suffix) {
-				s.dests.Delete(destKV.Key)
-			}
-		}
-	}
-
-	// remove this endpoint from the endpoints
-	s.endpoints.DeleteByPrefix(prefix)
 }
